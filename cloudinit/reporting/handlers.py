@@ -16,6 +16,7 @@ from typing import Union
 
 from cloudinit import performance, url_helper, util
 from cloudinit.registry import DictRegistry
+from cloudinit.sources.azure import identity
 
 LOG = logging.getLogger(__name__)
 
@@ -189,6 +190,7 @@ class HyperVKvpReportingHandler(ReportingHandler):
         HV_KVP_EXCHANGE_MAX_KEY_SIZE + HV_KVP_EXCHANGE_MAX_VALUE_SIZE
     )
     EVENT_PREFIX = "CLOUD_INIT"
+    ZERO_GUID = str(uuid.UUID(int=0))
     MSG_KEY = "msg"
     RESULT_KEY = "result"
     DESC_IDX_KEY = "msg_i"
@@ -209,6 +211,21 @@ class HyperVKvpReportingHandler(ReportingHandler):
         self.event_key_prefix = "{0}|{1}".format(
             self.EVENT_PREFIX, self.incarnation_no
         )
+
+        try:
+            vm_id = identity.query_vm_id()
+        except Exception as e:
+            LOG.warning("Failed to query VM ID: %s. Using zero-guid.", e)
+            vm_id = self.ZERO_GUID
+        else:
+            if not vm_id:
+                LOG.warning(
+                    "Query for VM ID returned empty value. Using zero-guid."
+                )
+                vm_id = self.ZERO_GUID
+
+        self.vm_id = vm_id
+
         self.publish_thread = threading.Thread(
             target=self._publish_event_routine
         )
@@ -268,10 +285,14 @@ class HyperVKvpReportingHandler(ReportingHandler):
         """
         the event key format is:
         CLOUD_INIT|<incarnation number>|<event_type>|<event_name>|<uuid>
-        [|subevent_index]
+        |<vm_id>[|subevent_index]
         """
-        return "{0}|{1}|{2}|{3}".format(
-            self.event_key_prefix, event.event_type, event.name, uuid.uuid4()
+        return "{0}|{1}|{2}|{3}|{4}".format(
+            self.event_key_prefix,
+            event.event_type,
+            event.name,
+            uuid.uuid4(),
+            self.vm_id,
         )
 
     def _encode_kvp_item(self, key, value):
