@@ -7,6 +7,7 @@ import struct
 import time
 import uuid
 import zlib
+from datetime import datetime, timezone
 from unittest import mock
 
 import pytest
@@ -253,6 +254,80 @@ class TestKvpReporter:
             instantiated_handler_registry.unregister_item(
                 "telemetry", force=False
             )
+
+    @pytest.mark.parametrize(
+        "lines",
+        [
+            [
+                "[    0.000000] Linux version 5.15.0 (gcc) #1 SMP",
+                "[    0.123456] Command line: BOOT_IMAGE=/vmlinuz",
+                "[    1.234567] systemd[1]: Starting Cloud-init...",
+            ],
+            [
+                "[    0.876543] cloud-init[123]: data source Azure",
+                "[    1.234567] cloud-init[123]: parsing metadata",
+                "[    1.345678] cloud-init[123]: network config applied",
+            ],
+            [
+                "[    2.000000] hv_vmbus: Vmbus version:4.0",
+                "[    2.100000] hv_utils: Registering HyperV Utility Driver",
+                "[    2.200000] hv_kvp_daemon: started",
+            ],
+        ],
+    )
+    def test_multi_kvp_split_keeps_valid_json(self, reporter, lines):
+        def room_for_desc_for_name(name):
+            evt = events.FinishReportingEvent(
+                name,
+                "x",
+                duration=1.0,
+                result=events.status.FAIL,
+            )
+            meta_data = {
+                "name": evt.name,
+                "type": evt.event_type,
+                "ts": (
+                    datetime.fromtimestamp(
+                        evt.timestamp, timezone.utc
+                    ).isoformat()
+                ),
+                "result": evt.result,
+                "duration": evt.duration,
+                "msg": "",
+            }
+            data_without_desc = json.dumps(
+                meta_data, separators=reporter.JSON_SEPARATORS
+            )
+            return (
+                reporter.HV_KVP_AZURE_MAX_VALUE_SIZE
+                - len(data_without_desc)
+                - 8
+            )
+
+        name = "event"
+        room_for_desc = room_for_desc_for_name(name)
+        while room_for_desc <= 0:
+            name += "x"
+            room_for_desc = room_for_desc_for_name(name)
+
+        description = "\n".join(lines)
+        if len(description) < room_for_desc + 10:
+            repeats = (room_for_desc // (len(description) + 1)) + 2
+            description = "\n".join(lines * repeats)
+
+        reporter.publish_event(
+            events.FinishReportingEvent(
+                name,
+                description,
+                duration=1.0,
+                result=events.status.FAIL,
+            )
+        )
+        reporter.q.join()
+        kvps = list(reporter._iterate_kvps(0))
+        assert len(kvps) > 1
+        for kvp in kvps:
+            json.loads(kvp["value"])
 
     def validate_compressed_kvps(self, reporter, count, values):
         reporter.q.join()
