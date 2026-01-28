@@ -255,54 +255,42 @@ class TestKvpReporter:
                 "telemetry", force=False
             )
 
+    def test_report_compressed_event_multi_kvp(self, reporter):
+        try:
+            instantiated_handler_registry.register_item("telemetry", reporter)
+            event_desc = b"a" * 6000
+            azure.report_compressed_event("dmesg", event_desc)
+
+            reporter.q.join()
+            kvps = list(reporter._iterate_kvps(0))
+            msg_slices = []
+            for kvp in kvps:
+                kvp_value_json = json.loads(kvp["value"])
+                if kvp_value_json["type"] != azure.COMPRESSED_EVENT_TYPE:
+                    continue
+                msg_slices.append(
+                    (kvp_value_json["msg_i"], kvp_value_json["msg"])
+                )
+            assert len(msg_slices) > 1
+            full_msg = "".join(
+                msg for _, msg in sorted(msg_slices, key=lambda x: x[0])
+            )
+            evt_msg_json = json.loads(full_msg)
+            evt_data = zlib.decompress(
+                base64.decodebytes(evt_msg_json["data"].encode("ascii"))
+            )
+            assert evt_data == event_desc
+            assert evt_msg_json["encoding"] == "gz+b64"
+        finally:
+            instantiated_handler_registry.unregister_item(
+                "telemetry", force=False
+            )
+
     def test_multi_kvp_split_keeps_valid_json(self, reporter):
-        def room_for_desc_for_name(name):
-            evt = events.FinishReportingEvent(
-                name,
-                "x",
-                duration=1.0,
-                result=events.status.FAIL,
-            )
-            meta_data = {
-                "name": evt.name,
-                "type": evt.event_type,
-                "ts": (
-                    datetime.fromtimestamp(
-                        evt.timestamp, timezone.utc
-                    ).isoformat()
-                ),
-                "result": evt.result,
-                "duration": evt.duration,
-                "msg": "",
-            }
-            data_without_desc = json.dumps(
-                meta_data, separators=reporter.JSON_SEPARATORS
-            )
-            return (
-                reporter.HV_KVP_AZURE_MAX_VALUE_SIZE
-                - len(data_without_desc)
-                - 8
-            )
-
-        lines = [
-            "[    0.000000] Linux version 5.15.0 (gcc) #1 SMP",
-            "[    0.123456] Command line: BOOT_IMAGE=/vmlinuz",
-            "[    1.234567] systemd[1]: Starting Cloud-init...",
-        ]
-        name = "event"
-        room_for_desc = room_for_desc_for_name(name)
-        while room_for_desc <= 0:
-            name += "x"
-            room_for_desc = room_for_desc_for_name(name)
-
-        description = "\n".join(lines)
-        if len(description) < room_for_desc + 10:
-            repeats = (room_for_desc // (len(description) + 1)) + 2
-            description = "\n".join(lines * repeats)
-
+        description = "ab" * reporter.HV_KVP_AZURE_MAX_VALUE_SIZE
         reporter.publish_event(
             events.FinishReportingEvent(
-                name,
+                "event",
                 description,
                 duration=1.0,
                 result=events.status.FAIL,
@@ -315,15 +303,7 @@ class TestKvpReporter:
             json.loads(kvp["value"])
 
     def test_multi_kvp_finish_event_with_duration(self, reporter):
-        description = "\n".join(
-            [
-                "[    0.000000] Linux version 5.15.0 (gcc) #1 SMP",
-                "[    0.123456] Command line: BOOT_IMAGE=/vmlinuz",
-                "[    1.234567] systemd[1]: Starting Cloud-init...",
-            ]
-        )
-        description = "\n".join([description] * 400)
-
+        description = "ab" * reporter.HV_KVP_AZURE_MAX_VALUE_SIZE
         reporter.publish_event(
             events.FinishReportingEvent(
                 "event",
