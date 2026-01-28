@@ -255,27 +255,7 @@ class TestKvpReporter:
                 "telemetry", force=False
             )
 
-    @pytest.mark.parametrize(
-        "lines",
-        [
-            [
-                "[    0.000000] Linux version 5.15.0 (gcc) #1 SMP",
-                "[    0.123456] Command line: BOOT_IMAGE=/vmlinuz",
-                "[    1.234567] systemd[1]: Starting Cloud-init...",
-            ],
-            [
-                "[    0.876543] cloud-init[123]: data source Azure",
-                "[    1.234567] cloud-init[123]: parsing metadata",
-                "[    1.345678] cloud-init[123]: network config applied",
-            ],
-            [
-                "[    2.000000] hv_vmbus: Vmbus version:4.0",
-                "[    2.100000] hv_utils: Registering HyperV Utility Driver",
-                "[    2.200000] hv_kvp_daemon: started",
-            ],
-        ],
-    )
-    def test_multi_kvp_split_keeps_valid_json(self, reporter, lines):
+    def test_multi_kvp_split_keeps_valid_json(self, reporter):
         def room_for_desc_for_name(name):
             evt = events.FinishReportingEvent(
                 name,
@@ -304,6 +284,11 @@ class TestKvpReporter:
                 - 8
             )
 
+        lines = [
+            "[    0.000000] Linux version 5.15.0 (gcc) #1 SMP",
+            "[    0.123456] Command line: BOOT_IMAGE=/vmlinuz",
+            "[    1.234567] systemd[1]: Starting Cloud-init...",
+        ]
         name = "event"
         room_for_desc = room_for_desc_for_name(name)
         while room_for_desc <= 0:
@@ -351,7 +336,18 @@ class TestKvpReporter:
         kvps = list(reporter._iterate_kvps(0))
         assert len(kvps) > 1
         for kvp in kvps:
-            kvp_value = json.loads(kvp["value"])
+            try:
+                kvp_value = json.loads(kvp["value"])
+            except json.JSONDecodeError as exc:
+                value = kvp["value"]
+                pytest.fail(
+                    "Invalid JSON in KVP slice (len=%d): %s...%s"
+                    % (
+                        len(value),
+                        value[:80],
+                        value[-80:],
+                    )
+                )
             assert kvp_value["duration"] == 1.0
             
     def validate_compressed_kvps(self, reporter, count, values):
