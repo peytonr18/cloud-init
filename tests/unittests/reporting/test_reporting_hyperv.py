@@ -329,6 +329,31 @@ class TestKvpReporter:
         for kvp in kvps:
             json.loads(kvp["value"])
 
+    def test_multi_kvp_finish_event_with_duration(self, reporter):
+        description = "\n".join(
+            [
+                "[    0.000000] Linux version 5.15.0 (gcc) #1 SMP",
+                "[    0.123456] Command line: BOOT_IMAGE=/vmlinuz",
+                "[    1.234567] systemd[1]: Starting Cloud-init...",
+            ]
+        )
+        description = "\n".join([description] * 400)
+
+        reporter.publish_event(
+            events.FinishReportingEvent(
+                "event",
+                description,
+                duration=1.0,
+                result=events.status.FAIL,
+            )
+        )
+        reporter.q.join()
+        kvps = list(reporter._iterate_kvps(0))
+        assert len(kvps) > 1
+        for kvp in kvps:
+            kvp_value = json.loads(kvp["value"])
+            assert kvp_value["duration"] == 1.0
+            
     def validate_compressed_kvps(self, reporter, count, values):
         reporter.q.join()
         kvps = list(reporter._iterate_kvps(0))
