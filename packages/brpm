@@ -29,7 +29,7 @@ def find_root():
 if "avoid-pep8-E402-import-not-top-of-file":
     # Use the util functions from cloudinit
     sys.path.insert(0, find_root())
-    from cloudinit import subp, templater, util, temp_utils
+    from cloudinit import subp, templater, util
 
 
 # Subdirectories of the ~/rpmbuild dir
@@ -68,20 +68,6 @@ def read_dependencies(distro):
     return (build_deps, run_deps, test_deps)
 
 
-def _meson_supports_python_install_env():
-    """Return True when meson supports python.install_env option (>=0.63.0)."""
-    import re
-    try:
-        out, _ = subp.subp(["meson", "--version"])
-    except subp.ProcessExecutionError:
-        return False
-    match = re.match(r"^(\d+)\.(\d+)\.(\d+)", out.strip())
-    if not match:
-        return False
-    version = tuple(int(part) for part in match.groups())
-    return version >= (0, 63, 0)
-
-
 def read_version_from_meson():
     """Read package version from meson project and git."""
     if not subp.which("meson"):
@@ -91,17 +77,17 @@ def read_version_from_meson():
             "./tools/read-dependencies --distro <YOUR_DISTRO> --test-distro"
         )
         sys.exit(1)
-    meson_args = [
-        "meson",
-        "setup",
-        "-Dinit_system=systemd",
-        "-Ddisable_sshd_keygen=true",
-    ]
-    if _meson_supports_python_install_env():
-        meson_args.append("-Dpython.install_env=auto")
     with temp_utils.tempdir(needs_exe=True) as tdir:
         builddir = os.path.abspath(os.path.join(tdir, "builddir"))
-        subp.subp(meson_args + [builddir])
+        subp.subp(
+            [
+                "meson",
+                "setup",
+                "builddir",
+                "-Dinit_system=systemd",
+                "-Ddisable_sshd_keygen=true",
+            ]
+        )
         out, _ = subp.subp(["meson", "introspect", "--projectinfo", builddir])
     version = json.loads(out)["version"]
     try:
