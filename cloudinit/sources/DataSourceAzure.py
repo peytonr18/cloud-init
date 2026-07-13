@@ -309,6 +309,13 @@ BUILTIN_CLOUD_EPHEMERAL_DISK_CONFIG = {
 DS_CFG_PATH = ["datasource", DS_NAME]
 DS_CFG_KEY_PRESERVE_NTFS = "never_destroy_ntfs"
 
+# Subset of BUILTIN_DS_CONFIG keys which may be overridden at runtime via
+# cloud-config custom data (user-data).  This lets a single image opt in to
+# datasource behavior at deployment time rather than baking the option into a
+# purpose-built image.  Only options which are safe for a tenant to control
+# should be listed here.
+RUNTIME_OVERRIDABLE_DS_CFG_KEYS = frozenset({"experimental_skip_ready_report"})
+
 # The redacted password fails to meet password complexity requirements
 # so we can safely use this to mask/redact the password in the ovf-env.xml
 DEF_PASSWD_REDACTION = "REDACTED"
@@ -837,6 +844,24 @@ class DataSourceAzure(sources.DataSource):
         if seed:
             crawled_data["metadata"]["random_seed"] = seed
         crawled_data["metadata"]["instance-id"] = self._iid()
+
+        # Apply any datasource options supplied at runtime via custom data
+        # (user-data).  This lets a single image opt in to runtime-
+        # configurable datasource behavior (e.g.
+        # experimental_skip_ready_report) rather than baking the option into
+        # the image.  Runtime options take precedence over image-provided
+        # datasource configuration, consistent with cloud-init's user-data
+        # precedence model.
+        runtime_overrides = _ds_cfg_overrides_from_customdata(
+            crawled_data["userdata_raw"]
+        )
+        if runtime_overrides:
+            report_diagnostic_event(
+                "Applying datasource options from custom data: %s"
+                % runtime_overrides,
+                logger_func=LOG.info,
+            )
+            self.ds_cfg = util.mergemanydict([runtime_overrides, self.ds_cfg])
 
         if self._negotiated is False and self._is_ephemeral_networking_up():
             if self.ds_cfg.get("experimental_skip_ready_report", False):
@@ -1719,6 +1744,48 @@ def _userdata_from_imds(imds_data):
         return imds_data["compute"]["userData"]
     except KeyError:
         return None
+
+
+def _ds_cfg_overrides_from_customdata(userdata_raw) -> dict:
+    """Extract runtime-overridable datasource options from custom data.
+
+    Allow datasource behavior to be selected at deployment time via
+    cloud-config custom data (user-data) rather than baking options into a
+    purpose-built image.  Parse the custom data for a
+    ``datasource: {Azure: {...}}`` mapping and return only those keys which
+    are permitted to be overridden at runtime, as declared by
+    RUNTIME_OVERRIDABLE_DS_CFG_KEYS.
+
+    ``userdata_raw`` has already been base64-decoded by the caller, so it is
+    the plain user-data content.  Only plain ``#cloud-config`` custom data is
+    inspected; MIME multipart and other user-data formats are ignored.
+
+    @param userdata_raw: Decoded custom data (user-data) as bytes or str.
+    @return: Dict of overridable ds_cfg options found in custom data.
+    """
+    if not userdata_raw:
+        return {}
+
+    try:
+        content = userdata_raw
+        if isinstance(content, bytes):
+            content = content.decode("utf-8", errors="replace")
+        if not content.lstrip().startswith("#cloud-config"):
+            return {}
+
+        parsed = util.load_yaml(content, default={})
+        ds_options = parsed.get("datasource", {}).get(DS_NAME, {})
+        return {
+            key: value
+            for key, value in ds_options.items()
+            if key in RUNTIME_OVERRIDABLE_DS_CFG_KEYS
+        }
+    except Exception as e:
+        report_diagnostic_event(
+            "Failed parsing datasource options from custom data: %s" % e,
+            logger_func=LOG.warning,
+        )
+        return {}
 
 
 def _hostname_from_imds(imds_data):

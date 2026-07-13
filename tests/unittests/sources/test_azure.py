@@ -3964,6 +3964,67 @@ class TestInstanceId:
         assert id == "50109936-ef07-47fe-ac82-890c853f60d5"
 
 
+class TestDsCfgOverridesFromCustomdata:
+    """Tests for _ds_cfg_overrides_from_customdata."""
+
+    @pytest.mark.parametrize(
+        "userdata_raw,expected",
+        [
+            # Empty/missing custom data yields no overrides.
+            (None, {}),
+            ("", {}),
+            (b"", {}),
+            # Non cloud-config content is ignored.
+            (b"#!/bin/sh\necho hi\n", {}),
+            # Cloud-config without a datasource section yields nothing.
+            ("#cloud-config\npackages: [foo]\n", {}),
+            # Whitelisted option is extracted.
+            (
+                "#cloud-config\n"
+                "datasource:\n"
+                "  Azure:\n"
+                "    experimental_skip_ready_report: true\n",
+                {"experimental_skip_ready_report": True},
+            ),
+            # Non-whitelisted keys are filtered out.
+            (
+                "#cloud-config\n"
+                "datasource:\n"
+                "  Azure:\n"
+                "    data_dir: /tmp/x\n"
+                "    apply_network_config: false\n"
+                "    experimental_skip_ready_report: true\n",
+                {"experimental_skip_ready_report": True},
+            ),
+            # A datasource section for a different datasource is ignored.
+            (
+                "#cloud-config\n"
+                "datasource:\n"
+                "  Ec2:\n"
+                "    experimental_skip_ready_report: true\n",
+                {},
+            ),
+            # Malformed YAML does not raise.
+            ("#cloud-config\nfoo: [1, 2\n", {}),
+            # A datasource value that is not a mapping is ignored.
+            ("#cloud-config\ndatasource: foo\n", {}),
+        ],
+    )
+    def test_parsing(self, userdata_raw, expected):
+        assert dsaz._ds_cfg_overrides_from_customdata(userdata_raw) == expected
+
+    def test_bytes_customdata(self):
+        raw = (
+            "#cloud-config\n"
+            "datasource:\n"
+            "  Azure:\n"
+            "    experimental_skip_ready_report: true\n"
+        ).encode("utf-8")
+        assert dsaz._ds_cfg_overrides_from_customdata(raw) == {
+            "experimental_skip_ready_report": True
+        }
+
+
 class TestProvisioning:
     @pytest.fixture(autouse=True)
     def provisioning_setup(
@@ -5418,6 +5479,79 @@ class TestProvisioning:
         assert (
             len(self.mock_report_dmesg_to_kvp.mock_calls) == expected_kvp_count
         )
+
+    @pytest.mark.parametrize(
+        "custom_data,expected_skip",
+        [
+            # Opt in to skipping the ready report via custom data.
+            (
+                "#cloud-config\n"
+                "datasource:\n"
+                "  Azure:\n"
+                "    experimental_skip_ready_report: true\n",
+                True,
+            ),
+            # Explicitly disable via custom data (report ready still happens).
+            (
+                "#cloud-config\n"
+                "datasource:\n"
+                "  Azure:\n"
+                "    experimental_skip_ready_report: false\n",
+                False,
+            ),
+            # Non-whitelisted keys are ignored; the whitelisted key still
+            # applies and the ready report is skipped.
+            (
+                "#cloud-config\n"
+                "datasource:\n"
+                "  Azure:\n"
+                "    data_dir: /tmp/malicious\n"
+                "    experimental_skip_ready_report: true\n",
+                True,
+            ),
+            # No datasource section: report ready happens as usual.
+            ("#cloud-config\nruncmd:\n  - echo hi\n", False),
+        ],
+    )
+    def test_skip_ready_report_via_customdata(
+        self, custom_data, expected_skip
+    ):
+        """Runtime ds_cfg options are honored from custom data."""
+        ovf = construct_ovf_env(
+            custom_data=custom_data,
+            provision_guest_proxy_agent=False,
+        )
+        md, ud, cfg = dsaz.read_azure_ovf(ovf)
+        self.mock_util_mount_cb.return_value = (md, ud, cfg, {})
+        self.mock_readurl.side_effect = [
+            mock.MagicMock(contents=json.dumps(self.imds_md).encode()),
+        ]
+        self.mock_azure_get_metadata_from_fabric.return_value = []
+
+        self.azure_ds._check_and_get_data()
+
+        # Whitelisted option reflects custom data; non-whitelisted options
+        # (e.g. data_dir) always keep their built-in default.
+        assert (
+            self.azure_ds.ds_cfg["experimental_skip_ready_report"]
+            is expected_skip
+        )
+        assert self.azure_ds.ds_cfg["data_dir"] == dsaz.AGENT_SEED_DIR
+
+        if expected_skip:
+            # Ready report (fabric hand-off) is skipped.
+            assert self.mock_azure_get_metadata_from_fabric.mock_calls == []
+            assert not self.mock_kvp_report_success_to_host.mock_calls
+        else:
+            assert self.mock_azure_get_metadata_from_fabric.mock_calls == [
+                mock.call(
+                    endpoint="10.11.12.13",
+                    distro=self.azure_ds.distro,
+                    iso_dev="/dev/sr0",
+                    pubkey_info=None,
+                )
+            ]
+            assert len(self.mock_kvp_report_success_to_host.mock_calls) == 1
 
     def test_imds_failure_results_in_provisioning_failure(self):
         self.mock_readurl.side_effect = url_helper.UrlError(
