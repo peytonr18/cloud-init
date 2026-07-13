@@ -520,6 +520,19 @@ class TestValidateCloudConfigSchema:
         )
 
     @skipUnlessJsonSchema()
+    def test_validateconfig_schema_allows_datasource_config(self):
+        """A top-level datasource block validates against the full schema.
+
+        Datasource options (e.g. supplied via Azure custom data) must not
+        trip the top-level additionalProperties check.
+        """
+        config = {
+            "datasource": {"Azure": {"experimental_skip_ready_report": True}}
+        }
+        # Must not raise SchemaValidationError for the datasource key.
+        validate_cloudconfig_schema(config, schema=get_schema(), strict=True)
+
+    @skipUnlessJsonSchema()
     @pytest.mark.parametrize(
         "schema,should_succeed_validating,expected_err_msg_of_either_schema_or_its_negation",
         [
