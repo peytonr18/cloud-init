@@ -12,6 +12,23 @@ instance id, display name, and other cloud specific details.
 Any meta-data processed by ``cloud-init``'s datasources can be inspected. See
 :ref:`instance-data` for more information.
 
+Datasource configuration
+========================
+
+Datasource-specific behaviour is controlled through datasource configuration
+options. These are normally provided through system configuration (for
+example, in :file:`/etc/cloud/cloud.cfg` or :file:`/etc/cloud/cloud.cfg.d/`)
+under the ``datasource`` key, and are therefore typically baked into an image.
+
+A datasource may additionally choose to support processing a subset of its
+configuration options at runtime from user-data (for example, a cloud's
+custom-data). This allows a single image to select datasource behaviour at
+deployment time rather than requiring a purpose-built image. When supported,
+the options are supplied in a ``#cloud-config`` ``datasource`` block and
+runtime values take precedence over image-provided configuration. Refer to the
+documentation for a specific datasource to see whether it supports this and
+which options may be overridden.
+
 How to configure which datasource to use
 ========================================
 

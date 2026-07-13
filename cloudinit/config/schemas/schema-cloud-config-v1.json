@@ -807,6 +807,11 @@
           "deprecated": true,
           "deprecated_version": "24.2",
           "deprecated_description": "System and/or distro specific settings. This is not intended to be overridden by user-data or vendor-data."
+        },
+        "datasource": {
+          "type": "object",
+          "description": "Datasource-specific configuration consumed by the active datasource. Some datasources support overriding a subset of their options at runtime by supplying this key in cloud-config (custom data). Refer to the documentation for the active datasource for supported options.",
+          "additionalProperties": true
         }
       }
     },
@@ -4207,6 +4212,7 @@
     "cloud_final_modules": {},
     "cloud_init_modules": {},
     "create_hostname_file": {},
+    "datasource": {},
     "device_aliases": {},
     "disable_ec2_metadata": {},
     "disable_root": {},

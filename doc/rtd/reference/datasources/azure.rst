@@ -70,6 +70,13 @@ The settings that may be configured are:
   A dictionary defining which device paths should be interpreted as ephemeral
   images. See :ref:`cc_disk_setup <mod_cc_disk_setup>` module for more info.
 
+* :command:`experimental_skip_ready_report`
+
+  Boolean to skip reporting ready to the Azure fabric once provisioning
+  completes. When set to True, ``cloud-init`` does not perform the final
+  report-ready hand-off, allowing another component to own that step. Default
+  is False.
+
 Configuration for the datasource can also be read from a ``dscfg`` entry in
 the ``LinuxProvisioningConfigurationSet``. Content in ``dscfg`` node is
 expected to be base64 encoded YAML content, and it will be merged into the
@@ -87,6 +94,33 @@ An example configuration with the default values is provided below:
        data_dir: /var/lib/waagent
        disk_aliases:
          ephemeral0: /dev/disk/cloud/azure_resource
+
+
+Runtime configuration via user-data
+===================================
+
+In addition to system configuration, the Azure datasource supports overriding
+a subset of its configuration options at runtime through user-data
+(``CustomData``). This allows a single image to select datasource behaviour at
+deployment time rather than requiring a purpose-built image.
+
+Supply the options as a ``#cloud-config`` document containing a
+``datasource: Azure`` mapping. Only the following options may be overridden at
+runtime; any other keys in the mapping are ignored:
+
+* :command:`experimental_skip_ready_report`
+
+Values provided via user-data take precedence over the same option provided
+through system configuration.
+
+Example ``CustomData`` (before base64 encoding):
+
+.. code-block:: yaml
+
+   #cloud-config
+   datasource:
+     Azure:
+       experimental_skip_ready_report: true
 
 
 User-data
