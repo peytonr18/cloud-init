@@ -321,6 +321,12 @@ DS_CFG_KEY_PRESERVE_NTFS = "never_destroy_ntfs"
 # should be listed here.
 RUNTIME_OVERRIDABLE_DS_CFG_KEYS = frozenset({"experimental_skip_ready_report"})
 
+# Marker line that, when present anywhere in a #cloud-boothook custom-data
+# payload, signals that experimental_skip_ready_report should be enabled.
+# AKS delivers custom data as a boothook shell script rather than cloud-config
+# YAML, so this marker provides an equivalent opt-in mechanism.
+BOOTHOOK_SKIP_READY_MARKER = "# azure-experimental-node-ready"
+
 # The redacted password fails to meet password complexity requirements
 # so we can safely use this to mask/redact the password in the ovf-env.xml
 DEF_PASSWD_REDACTION = "REDACTED"
@@ -1797,14 +1803,20 @@ def _ds_cfg_overrides_from_customdata(userdata_raw) -> dict:
 
     Allow datasource behavior to be selected at deployment time via
     cloud-config custom data (user-data) rather than baking options into a
-    purpose-built image.  Parse the custom data for a
-    ``datasource: {Azure: {...}}`` mapping and return only those keys which
-    are permitted to be overridden at runtime, as declared by
-    RUNTIME_OVERRIDABLE_DS_CFG_KEYS.
+    purpose-built image.
+
+    Two formats are supported:
+
+    1. ``#cloud-config`` YAML containing a ``datasource: {Azure: {...}}``
+       mapping -- only keys in RUNTIME_OVERRIDABLE_DS_CFG_KEYS are returned.
+
+    2. ``#cloud-boothook`` shell scripts containing the exact marker line
+       ``# azure-experimental-node-ready`` -- this enables
+       ``experimental_skip_ready_report``.
 
     ``userdata_raw`` has already been base64-decoded by the caller, so it is
-    the plain user-data content.  Only plain ``#cloud-config`` custom data is
-    inspected; MIME multipart and other user-data formats are ignored.
+    the plain user-data content.  MIME multipart and other user-data formats
+    are ignored.
 
     @param userdata_raw: Decoded custom data (user-data) as bytes or str.
     @return: Dict of overridable ds_cfg options found in custom data.
@@ -1816,16 +1828,24 @@ def _ds_cfg_overrides_from_customdata(userdata_raw) -> dict:
         content = userdata_raw
         if isinstance(content, bytes):
             content = content.decode("utf-8", errors="replace")
-        if not content.lstrip().startswith("#cloud-config"):
+
+        stripped = content.lstrip()
+        if stripped.startswith("#cloud-config"):
+            parsed = util.load_yaml(content, default={})
+            ds_options = parsed.get("datasource", {}).get(DS_NAME, {})
+            return {
+                key: value
+                for key, value in ds_options.items()
+                if key in RUNTIME_OVERRIDABLE_DS_CFG_KEYS
+            }
+
+        if stripped.startswith("#cloud-boothook"):
+            for line in content.splitlines():
+                if line.strip() == BOOTHOOK_SKIP_READY_MARKER:
+                    return {"experimental_skip_ready_report": True}
             return {}
 
-        parsed = util.load_yaml(content, default={})
-        ds_options = parsed.get("datasource", {}).get(DS_NAME, {})
-        return {
-            key: value
-            for key, value in ds_options.items()
-            if key in RUNTIME_OVERRIDABLE_DS_CFG_KEYS
-        }
+        return {}
     except Exception as e:
         report_diagnostic_event(
             "Failed parsing datasource options from custom data: %s" % e,

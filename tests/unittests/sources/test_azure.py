@@ -4153,6 +4153,79 @@ class TestDsCfgOverridesFromCustomdata:
             "experimental_skip_ready_report": True
         }
 
+    @pytest.mark.parametrize(
+        "userdata_raw,expected",
+        [
+            # Boothook with marker enables skip_ready_report.
+            (
+                "#cloud-boothook\n"
+                "#!/bin/sh\n"
+                "# azure-experimental-node-ready\n"
+                "echo hello\n",
+                {"experimental_skip_ready_report": True},
+            ),
+            # Marker can appear anywhere in the boothook.
+            (
+                "#cloud-boothook\n"
+                "#!/bin/sh\n"
+                "echo setup\n"
+                "# azure-experimental-node-ready\n"
+                "echo done\n",
+                {"experimental_skip_ready_report": True},
+            ),
+            # Boothook without marker yields no overrides.
+            (
+                "#cloud-boothook\n"
+                "#!/bin/sh\n"
+                "echo hello\n",
+                {},
+            ),
+            # Marker with leading/trailing whitespace on line still matches.
+            (
+                "#cloud-boothook\n"
+                "#!/bin/sh\n"
+                "  # azure-experimental-node-ready  \n"
+                "echo hello\n",
+                {"experimental_skip_ready_report": True},
+            ),
+            # Marker as substring of a longer comment does NOT match.
+            (
+                "#cloud-boothook\n"
+                "#!/bin/sh\n"
+                "## azure-experimental-node-ready\n"
+                "echo hello\n",
+                {},
+            ),
+            # Marker prefixed with extra text does NOT match.
+            (
+                "#cloud-boothook\n"
+                "#!/bin/sh\n"
+                "x # azure-experimental-node-ready\n"
+                "echo hello\n",
+                {},
+            ),
+            # Marker inside cloud-config YAML does NOT trigger boothook path.
+            (
+                "#cloud-config\n"
+                "runcmd:\n"
+                "  - echo '# azure-experimental-node-ready'\n",
+                {},
+            ),
+        ],
+    )
+    def test_boothook_marker(self, userdata_raw, expected):
+        assert dsaz._ds_cfg_overrides_from_customdata(userdata_raw) == expected
+
+    def test_boothook_marker_bytes(self):
+        raw = (
+            "#cloud-boothook\n"
+            "#!/bin/sh\n"
+            "# azure-experimental-node-ready\n"
+        ).encode("utf-8")
+        assert dsaz._ds_cfg_overrides_from_customdata(raw) == {
+            "experimental_skip_ready_report": True
+        }
+
 
 class TestProvisioning:
     @pytest.fixture(autouse=True)
@@ -5669,6 +5742,62 @@ class TestProvisioning:
 
         if expected_skip:
             # Ready report (fabric hand-off) is skipped.
+            assert self.mock_azure_get_metadata_from_fabric.mock_calls == []
+            assert not self.mock_kvp_report_success_to_host.mock_calls
+        else:
+            assert self.mock_azure_get_metadata_from_fabric.mock_calls == [
+                mock.call(
+                    endpoint="10.11.12.13",
+                    distro=self.azure_ds.distro,
+                    iso_dev="/dev/sr0",
+                    pubkey_info=None,
+                )
+            ]
+            assert len(self.mock_kvp_report_success_to_host.mock_calls) == 1
+
+    @pytest.mark.parametrize(
+        "custom_data,expected_skip",
+        [
+            # Boothook with marker skips report ready.
+            (
+                "#cloud-boothook\n"
+                "#!/bin/sh\n"
+                "# azure-experimental-node-ready\n"
+                "echo hello\n",
+                True,
+            ),
+            # Boothook without marker does not skip.
+            (
+                "#cloud-boothook\n"
+                "#!/bin/sh\n"
+                "echo hello\n",
+                False,
+            ),
+        ],
+    )
+    def test_skip_ready_report_via_boothook(
+        self, custom_data, expected_skip
+    ):
+        """Boothook marker triggers experimental_skip_ready_report."""
+        ovf = construct_ovf_env(
+            custom_data=custom_data,
+            provision_guest_proxy_agent=False,
+        )
+        md, ud, cfg = dsaz.read_azure_ovf(ovf)
+        self.mock_util_mount_cb.return_value = (md, ud, cfg, {})
+        self.mock_readurl.side_effect = [
+            mock.MagicMock(contents=json.dumps(self.imds_md).encode()),
+        ]
+        self.mock_azure_get_metadata_from_fabric.return_value = []
+
+        self.azure_ds._check_and_get_data()
+
+        assert (
+            self.azure_ds.ds_cfg["experimental_skip_ready_report"]
+            is expected_skip
+        )
+
+        if expected_skip:
             assert self.mock_azure_get_metadata_from_fabric.mock_calls == []
             assert not self.mock_kvp_report_success_to_host.mock_calls
         else:
