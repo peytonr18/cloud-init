@@ -331,6 +331,9 @@ class DataSourceAzure(sources.DataSource):
     }
     _negotiated = False
     _metadata_imds: Union[str, Dict[str, Any]] = sources.UNSET
+    # Public SSH keys resolved from the last crawl, or None if not yet
+    # resolved (e.g. when unpickled from an older version).
+    _public_ssh_keys: Optional[List[str]] = None
     _ci_pkl_version = 1
 
     def __init__(
@@ -793,10 +796,15 @@ class DataSourceAzure(sources.DataSource):
         # Report errors if IMDS network configuration is missing data.
         self.validate_imds_network_metadata(imds_md=imds_md)
 
+        # Normalize the IMDS public keys once per crawl, as doing so may log
+        # warnings and convert x509 certificates.
+        imds_public_keys = self._get_public_keys_from_imds(imds_md)
+
         crawled_data.update(
             {
                 "cfg": cfg,
                 "files": files,
+                "imds_public_keys": imds_public_keys,
                 "metadata": util.mergemanydict([md, {"imds": imds_md}]),
                 "userdata_raw": userdata_raw,
             }
@@ -888,7 +896,7 @@ class DataSourceAzure(sources.DataSource):
                 # Report ready and fetch public-keys from Wireserver,
                 # if required.
                 pubkey_info = self._determine_wireserver_pubkey_info(
-                    cfg=cfg, imds_md=imds_md
+                    cfg=cfg, imds_public_keys=imds_public_keys
                 )
                 try:
                     ssh_keys = self._report_ready(pubkey_info=pubkey_info)
@@ -954,6 +962,7 @@ class DataSourceAzure(sources.DataSource):
         """Reset any cached class attributes to defaults."""
         super(DataSourceAzure, self).clear_cached_attrs(attr_defaults)
         self._metadata_imds = sources.UNSET
+        self._public_ssh_keys = None
 
     @azure_ds_telemetry_reporter
     def ds_detect(self):
@@ -1032,6 +1041,9 @@ class DataSourceAzure(sources.DataSource):
             [crawled_data["metadata"], DEFAULT_METADATA]
         )
         self.userdata_raw = crawled_data["userdata_raw"]
+        self._public_ssh_keys = self._resolve_public_ssh_keys(
+            crawled_data["imds_public_keys"]
+        )
 
         # walinux agent writes files world readable, but expects
         # the directory to be protected.
@@ -1052,25 +1064,32 @@ class DataSourceAzure(sources.DataSource):
     def get_public_ssh_keys(self) -> List[str]:
         """
         Retrieve public SSH keys.
-        """
-        try:
-            return self._get_public_keys_from_imds(self.metadata["imds"])
-        except (KeyError, ValueError):
-            pass
 
+        Keys are resolved once per crawl and cached, as resolving them may
+        log warnings and convert x509 certificates.
+        """
+        if self._public_ssh_keys is None:
+            self._public_ssh_keys = self._resolve_public_ssh_keys(
+                self._get_public_keys_from_imds(self.metadata.get("imds", {}))
+            )
+        return list(self._public_ssh_keys)
+
+    def _resolve_public_ssh_keys(
+        self, imds_public_keys: Optional[List[str]]
+    ) -> List[str]:
+        """Use the IMDS keys if usable, otherwise fall back to OVF keys."""
+        if imds_public_keys is not None:
+            return imds_public_keys
         return self._get_public_keys_from_ovf()
 
-    def _get_public_keys_from_imds(self, imds_md: dict) -> List[str]:
+    def _get_public_keys_from_imds(self, imds_md: dict) -> Optional[List[str]]:
         """Get SSH keys from IMDS metadata.
 
         Keys provided by IMDS may be in OpenSSH format or as x509
         certificates. x509 certificates are converted to OpenSSH format.
 
-        :raises KeyError: if IMDS metadata is malformed/missing.
-        :raises ValueError: if any key is not supported or cannot be
-            converted.
-
-        :returns: List of keys.
+        :returns: List of keys, or None if IMDS metadata has no keys or any
+            key is not supported or cannot be converted.
         """
         try:
             public_keys = [
@@ -1080,7 +1099,7 @@ class DataSourceAzure(sources.DataSource):
         except KeyError:
             log_msg = "No SSH keys found in IMDS metadata"
             report_diagnostic_event(log_msg, logger_func=LOG.debug)
-            raise
+            return None
 
         ssh_keys = []
         for i, key in enumerate(public_keys):
@@ -1091,7 +1110,7 @@ class DataSourceAzure(sources.DataSource):
                     f"Failed to process IMDS public key index={i}: {error}"
                 )
                 report_diagnostic_event(log_msg, logger_func=LOG.error)
-                raise
+                return None
 
         log_msg = "Retrieved {} keys from IMDS".format(len(ssh_keys))
         report_diagnostic_event(log_msg, logger_func=LOG.debug)
@@ -1614,16 +1633,17 @@ class DataSourceAzure(sources.DataSource):
 
     @azure_ds_telemetry_reporter
     def _determine_wireserver_pubkey_info(
-        self, *, cfg: dict, imds_md: dict
+        self, *, cfg: dict, imds_public_keys: Optional[List[str]]
     ) -> Optional[List[str]]:
         """Determine the fingerprints we need to retrieve from Wireserver.
+
+        :param imds_public_keys: Keys from IMDS, or None if IMDS has no
+            usable keys.
 
         :return: List of keys to request from Wireserver, if any, else None.
         """
         pubkey_info: Optional[List[str]] = None
-        try:
-            self._get_public_keys_from_imds(imds_md)
-        except (KeyError, ValueError):
+        if imds_public_keys is None:
             pubkey_info = cfg.get("_pubkeys", None)
             log_msg = "Retrieved {} fingerprints from OVF".format(
                 len(pubkey_info) if pubkey_info is not None else 0

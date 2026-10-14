@@ -7,6 +7,7 @@ import datetime
 import json
 import logging
 import os
+import pickle
 import shutil
 import stat
 import sys
@@ -1627,7 +1628,7 @@ scbus-1 on xpt0 bus 0
 
         assert_count_equal(
             crawled_metadata.keys(),
-            ["cfg", "files", "metadata", "userdata_raw"],
+            ["cfg", "files", "imds_public_keys", "metadata", "userdata_raw"],
         )
         assert crawled_metadata["cfg"] == expected_cfg
         assert list(crawled_metadata["files"].keys()) == ["ovf-env.xml"]
@@ -1635,11 +1636,13 @@ scbus-1 on xpt0 bus 0
             b"<ns1:HostName>myhost</ns1:HostName>"
             in crawled_metadata["files"]["ovf-env.xml"]
         )
+        assert crawled_metadata["imds_public_keys"] == ["ssh-rsa key1"]
         assert crawled_metadata["metadata"] == expected_metadata
         assert crawled_metadata["userdata_raw"] == b"FOOBAR"
         assert dsrc.userdata_raw is None
         assert dsrc.metadata == {}
         assert dsrc._metadata_imds == UNSET
+        assert dsrc._public_ssh_keys is None
         assert not os.path.isfile(os.path.join(waagent_d, "ovf-env.xml"))
 
     def test_crawl_metadata_raises_invalid_metadata_on_error(self, get_ds):
@@ -2382,12 +2385,29 @@ scbus-1 on xpt0 bus 0
     def _boot_with_imds_public_keys(self, get_ds, mocker, public_keys):
         """Boot with the given IMDS public keys.
 
+        :returns: (public SSH keys, mocked parse_certificates)
+        """
+        dsrc, m_parse_certificates = self._boot_ds_with_imds_public_keys(
+            get_ds, mocker, public_keys
+        )
+        return dsrc.get_public_ssh_keys(), m_parse_certificates
+
+    @staticmethod
+    def _pickle_round_trip(dsrc):
+        """Pickle and unpickle, as a later boot stage loads obj.pkl."""
+        # get_ds() sets a Mock on the distro, which cannot be pickled.
+        del dsrc.distro.get_tmp_exec_path
+        return pickle.loads(pickle.dumps(dsrc))
+
+    def _boot_ds_with_imds_public_keys(self, get_ds, mocker, public_keys):
+        """Boot with the given IMDS public keys.
+
         The real Wireserver key path is used; only its network calls and
         certificate decryption are mocked. The OVF lists a fingerprint whose
         Wireserver certificate converts to "ssh-rsa wireserver-key" and a
         value "ssh-rsa ovf-key", so a fallback shows up in the returned keys.
 
-        :returns: (public SSH keys, mocked parse_certificates)
+        :returns: (booted datasource, mocked parse_certificates)
         """
         mocker.patch.object(azure_helper, "AzureEndpointHttpClient")
         m_goal_state = mocker.patch.object(azure_helper, "GoalState")
@@ -2420,7 +2440,7 @@ scbus-1 on xpt0 bus 0
         )
         dsrc.get_data()
         dsrc.setup(True)
-        return dsrc.get_public_ssh_keys(), m_parse_certificates
+        return dsrc, m_parse_certificates
 
     @pytest.mark.parametrize("line_ending", ["\n", "\r\n"], ids=["lf", "crlf"])
     @mock.patch(
@@ -2498,6 +2518,96 @@ scbus-1 on xpt0 bus 0
                 "removed."
             ),
         ) in caplog.record_tuples
+
+    def test_get_public_ssh_keys_normalizes_imds_keys_once(
+        self, get_ds, mocker, caplog
+    ):
+        """IMDS keys are normalized once per crawl, not on every request.
+
+        get_data() checks the keys for Wireserver and writes them to
+        instance-data.json, modules request them, and later boot stages load
+        the pickled datasource. None of these normalize the keys again.
+        """
+        m_normalize = mocker.spy(certs, "normalize_ssh_public_key")
+        dsrc, _ = self._boot_ds_with_imds_public_keys(
+            get_ds,
+            mocker,
+            [
+                {
+                    "keyData": "ssh-rsa AAAA\r\nBBBB generated-by-azure\r\n",
+                    "path": "path1",
+                }
+            ],
+        )
+        restored = self._pickle_round_trip(dsrc)
+
+        for ds in (dsrc, dsrc, restored, restored):
+            keys = ds.get_public_ssh_keys()
+            assert keys == ["ssh-rsa AAAABBBB generated-by-azure"]
+            # Callers get a copy, so they cannot modify the cached keys.
+            keys.append("ssh-rsa modified")
+
+        assert m_normalize.call_count == 1
+        assert (
+            caplog.record_tuples.count(
+                (
+                    "cloudinit.sources.azure.certs",
+                    logging.WARNING,
+                    (
+                        "SSH key contains embedded CRLF sequence(s) which "
+                        "are being removed."
+                    ),
+                )
+            )
+            == 1
+        )
+
+    @pytest.mark.parametrize(
+        "public_keys, expected",
+        [
+            pytest.param(
+                [{"keyData": "ssh-rsa openssh-key", "path": "path1"}],
+                ["ssh-rsa openssh-key"],
+                id="imds-keys",
+            ),
+            pytest.param(
+                [{"keyData": None, "path": "path1"}],
+                ["ssh-rsa wireserver-key", "ssh-rsa ovf-key"],
+                id="wireserver-fallback",
+            ),
+        ],
+    )
+    def test_get_public_ssh_keys_unpickled_from_older_version(
+        self, public_keys, expected, get_ds, mocker
+    ):
+        """A datasource pickled before keys were cached resolves them once."""
+        dsrc, _ = self._boot_ds_with_imds_public_keys(
+            get_ds, mocker, public_keys
+        )
+        del dsrc._public_ssh_keys
+        restored = self._pickle_round_trip(dsrc)
+        m_get_imds_keys = mocker.spy(restored, "_get_public_keys_from_imds")
+
+        assert restored.get_public_ssh_keys() == expected
+        assert restored.get_public_ssh_keys() == expected
+        assert m_get_imds_keys.call_count == 1
+
+    def test_get_public_ssh_keys_updated_on_recrawl(self, get_ds, mocker):
+        """Re-crawling metadata replaces the cached keys."""
+        dsrc, _ = self._boot_ds_with_imds_public_keys(
+            get_ds, mocker, [{"keyData": "ssh-rsa old-key", "path": "path1"}]
+        )
+        assert dsrc.get_public_ssh_keys() == ["ssh-rsa old-key"]
+
+        imds_data = copy.deepcopy(self.m_fetch.return_value)
+        imds_data["compute"]["publicKeys"] = [
+            {"keyData": "ssh-rsa new-key", "path": "path1"}
+        ]
+        self.m_fetch.return_value = imds_data
+        dsrc.clear_cached_attrs()
+        assert dsrc.get_data()
+
+        assert dsrc.get_public_ssh_keys() == ["ssh-rsa new-key"]
 
     @mock.patch(
         "cloudinit.sources.DataSourceAzure.certs.convert_x509_to_openssh"
@@ -3219,16 +3329,23 @@ class TestClearCachedData:
     def test_clear_cached_attrs_clears_imds(self, paths):
         """All class attributes are reset to defaults, including imds data."""
         dsrc = dsaz.DataSourceAzure({}, distro=mock.Mock(), paths=paths)
-        clean_values = [dsrc.metadata, dsrc.userdata, dsrc._metadata_imds]
+        clean_values = [
+            dsrc.metadata,
+            dsrc.userdata,
+            dsrc._metadata_imds,
+            dsrc._public_ssh_keys,
+        ]
         dsrc.metadata = "md"
         dsrc.userdata = "ud"
         dsrc._metadata_imds = "imds"
+        dsrc._public_ssh_keys = ["ssh-rsa key"]
         dsrc._dirty_cache = True
         dsrc.clear_cached_attrs()
         assert [
             dsrc.metadata,
             dsrc.userdata,
             dsrc._metadata_imds,
+            dsrc._public_ssh_keys,
         ] == clean_values
 
 
