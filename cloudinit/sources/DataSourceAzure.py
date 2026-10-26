@@ -1086,7 +1086,7 @@ class DataSourceAzure(sources.DataSource):
         for i, key in enumerate(public_keys):
             try:
                 if not isinstance(key, str):
-                    raise ValueError(f"Key is not a string: {type(key)}")
+                    raise ValueError(f"Public key is not a string: {type(key)}")
                 ssh_keys.append(certs.normalize_ssh_public_key(key))
             except ValueError as error:
                 log_msg = (
