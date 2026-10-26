@@ -2597,7 +2597,7 @@ scbus-1 on xpt0 bus 0
             logging.ERROR,
             (
                 "Failed to process IMDS public key index=1: "
-                f"Key is not a string: {key_type}"
+                f"Public key is not a string: {key_type}"
             ),
         ) in caplog.record_tuples
 
