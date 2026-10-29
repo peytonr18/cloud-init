@@ -74,6 +74,76 @@ class PPSType(Enum):
 
 PLATFORM_ENTROPY_SOURCE: Optional[str] = "/sys/firmware/acpi/tables/OEM0"
 
+# TUXOPS TEST-ONLY, NOT FOR UPSTREAM: fault injection used by tuxops
+# validation scenarios to force the Wireserver SSH public key fallback while
+# Azure still provides valid keys. It is inert unless the VM has this tag.
+TUXOPS_IMDS_KEY_FAULT_TAG = "tuxops-imds-public-keys-fault"
+TUXOPS_IMDS_KEY_FAULT_INVALID_X509 = "invalid-x509"
+TUXOPS_IMDS_KEY_FAULT_MISSING_PUBLIC_KEYS = "missing-public-keys"
+TUXOPS_IMDS_ONLY_MARKER_KEY = (
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIM5DS6SNlxt8SVrwzKhB40YW5rjc+tmwjaw"
+    "GBdhRvS6S tuxops-imds-only-marker"
+)
+TUXOPS_INVALID_X509_CERTIFICATE = (
+    "-----BEGIN CERTIFICATE-----\nINVALID\n-----END CERTIFICATE-----\n"
+)
+
+
+def _tuxops_get_imds_tag(compute: dict, name: str) -> Optional[str]:
+    tags_list = compute.get("tagsList")
+    if isinstance(tags_list, list):
+        for tag in tags_list:
+            if isinstance(tag, dict) and tag.get("name") == name:
+                return tag.get("value")
+        return None
+
+    tags = compute.get("tags")
+    if isinstance(tags, str):
+        for pair in tags.split(";"):
+            key, separator, value = pair.partition(":")
+            if separator and key == name:
+                return value
+    return None
+
+
+def _tuxops_inject_imds_public_key_fault(imds_md: dict) -> None:
+    """TUXOPS TEST-ONLY: corrupt IMDS public keys when the VM is tagged.
+
+    The keys from OVF/Wireserver are untouched, so the fallback can still
+    provide the VM's real keys.
+    """
+    compute = imds_md.get("compute") if isinstance(imds_md, dict) else None
+    if not isinstance(compute, dict):
+        return
+
+    mode = _tuxops_get_imds_tag(compute, TUXOPS_IMDS_KEY_FAULT_TAG)
+    if mode is None:
+        return
+
+    if mode == TUXOPS_IMDS_KEY_FAULT_INVALID_X509:
+        # A valid IMDS-only key precedes the invalid certificate so tests can
+        # verify the fallback discards every IMDS key, not just the bad one.
+        compute["publicKeys"] = [
+            {
+                "keyData": TUXOPS_IMDS_ONLY_MARKER_KEY,
+                "path": "/tuxops/imds-only-marker",
+            },
+            {
+                "keyData": TUXOPS_INVALID_X509_CERTIFICATE,
+                "path": "/tuxops/invalid-x509",
+            },
+        ] + list(compute.get("publicKeys", []))
+    elif mode == TUXOPS_IMDS_KEY_FAULT_MISSING_PUBLIC_KEYS:
+        compute.pop("publicKeys", None)
+    else:
+        LOG.error(
+            "TUXOPS TEST-ONLY: unknown IMDS public key fault mode: %s", mode
+        )
+        return
+
+    LOG.info("TUXOPS TEST-ONLY: injected IMDS public key fault: %s", mode)
+
+
 # List of static scripts and network config artifacts created by
 # stock ubuntu supported images.
 UBUNTU_EXTENDED_NETWORK_SCRIPTS = [
@@ -919,10 +989,12 @@ class DataSourceAzure(sources.DataSource):
         error_string: Optional[str] = None
         error_report: Optional[errors.ReportableError] = None
         try:
-            return imds.fetch_metadata_with_api_fallback(
+            imds_md = imds.fetch_metadata_with_api_fallback(
                 max_connection_errors=max_connection_errors,
                 retry_deadline=retry_deadline,
             )
+            _tuxops_inject_imds_public_key_fault(imds_md)
+            return imds_md
         except UrlError as error:
             error_string = str(error)
             duration = monotonic() - start_time

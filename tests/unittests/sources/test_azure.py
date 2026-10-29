@@ -2379,7 +2379,9 @@ scbus-1 on xpt0 bus 0
         assert ssh_keys == []
         assert m_parse_certificates.call_count == 0
 
-    def _boot_with_imds_public_keys(self, get_ds, mocker, public_keys):
+    def _boot_with_imds_public_keys(
+        self, get_ds, mocker, public_keys, tags_list=None
+    ):
         """Boot with the given IMDS public keys.
 
         The real Wireserver key path is used; only its network calls and
@@ -2402,6 +2404,8 @@ scbus-1 on xpt0 bus 0
 
         imds_data = copy.deepcopy(NETWORK_METADATA)
         imds_data["compute"]["publicKeys"] = public_keys
+        if tags_list is not None:
+            imds_data["compute"]["tagsList"] = tags_list
         self.m_fetch.return_value = imds_data
         data = {
             "ovfcontent": construct_ovf_env(
@@ -2600,6 +2604,137 @@ scbus-1 on xpt0 bus 0
                 f"Public key is not a string: {key_type}"
             ),
         ) in caplog.record_tuples
+
+    def _tuxops_fault_tags(self, mode):
+        return [{"name": dsaz.TUXOPS_IMDS_KEY_FAULT_TAG, "value": mode}]
+
+    @pytest.mark.skipif(
+        shutil.which("openssl") is None, reason="openssl not available"
+    )
+    @pytest.mark.allow_subp_for("openssl")
+    def test_tuxops_invalid_x509_fault_falls_back_to_wireserver(
+        self, get_ds, mocker, caplog
+    ):
+        """TUXOPS TEST-ONLY: the tagged fault forces the full key fallback."""
+        caplog.set_level(logging.DEBUG)
+
+        ssh_keys, m_parse_certificates = self._boot_with_imds_public_keys(
+            get_ds,
+            mocker,
+            [{"keyData": "ssh-rsa openssh-key", "path": "path1"}],
+            tags_list=self._tuxops_fault_tags(
+                dsaz.TUXOPS_IMDS_KEY_FAULT_INVALID_X509
+            ),
+        )
+
+        assert ssh_keys == ["ssh-rsa wireserver-key", "ssh-rsa ovf-key"]
+        assert dsaz.TUXOPS_IMDS_ONLY_MARKER_KEY not in ssh_keys
+        m_parse_certificates.assert_called_once()
+        assert (
+            MOCKPATH[:-1],
+            logging.ERROR,
+            (
+                "Failed to process IMDS public key index=1: Failed to convert "
+                "x509 certificate to OpenSSH format"
+            ),
+        ) in caplog.record_tuples
+        assert (
+            MOCKPATH[:-1],
+            logging.INFO,
+            "TUXOPS TEST-ONLY: injected IMDS public key fault: invalid-x509",
+        ) in caplog.record_tuples
+
+    def test_tuxops_missing_public_keys_fault_falls_back_to_wireserver(
+        self, get_ds, mocker, caplog
+    ):
+        """TUXOPS TEST-ONLY: a missing IMDS key field takes the KeyError
+        fallback path."""
+        caplog.set_level(logging.DEBUG)
+
+        ssh_keys, m_parse_certificates = self._boot_with_imds_public_keys(
+            get_ds,
+            mocker,
+            [{"keyData": "ssh-rsa openssh-key", "path": "path1"}],
+            tags_list=self._tuxops_fault_tags(
+                dsaz.TUXOPS_IMDS_KEY_FAULT_MISSING_PUBLIC_KEYS
+            ),
+        )
+
+        assert ssh_keys == ["ssh-rsa wireserver-key", "ssh-rsa ovf-key"]
+        m_parse_certificates.assert_called_once()
+        assert (
+            MOCKPATH[:-1],
+            logging.DEBUG,
+            "No SSH keys found in IMDS metadata",
+        ) in caplog.record_tuples
+        assert "Failed to process IMDS public key" not in caplog.text
+
+    @pytest.mark.parametrize(
+        "tags_list",
+        [
+            pytest.param(None, id="no-tags"),
+            pytest.param([{"name": "other", "value": "x"}], id="other-tag"),
+        ],
+    )
+    def test_tuxops_fault_is_inert_without_tag(
+        self, tags_list, get_ds, mocker, caplog
+    ):
+        """TUXOPS TEST-ONLY: without the tag, the PR behavior is unchanged."""
+        ssh_keys, m_parse_certificates = self._boot_with_imds_public_keys(
+            get_ds,
+            mocker,
+            [{"keyData": "ssh-rsa openssh-key", "path": "path1"}],
+            tags_list=tags_list,
+        )
+
+        assert ssh_keys == ["ssh-rsa openssh-key"]
+        m_parse_certificates.assert_not_called()
+        assert "TUXOPS" not in caplog.text
+
+    def test_tuxops_unknown_fault_mode_is_reported_and_ignored(
+        self, get_ds, mocker, caplog
+    ):
+        """TUXOPS TEST-ONLY: a misconfigured scenario fails loudly."""
+        ssh_keys, m_parse_certificates = self._boot_with_imds_public_keys(
+            get_ds,
+            mocker,
+            [{"keyData": "ssh-rsa openssh-key", "path": "path1"}],
+            tags_list=self._tuxops_fault_tags("unknown-mode"),
+        )
+
+        assert ssh_keys == ["ssh-rsa openssh-key"]
+        m_parse_certificates.assert_not_called()
+        assert (
+            MOCKPATH[:-1],
+            logging.ERROR,
+            "TUXOPS TEST-ONLY: unknown IMDS public key fault mode: "
+            "unknown-mode",
+        ) in caplog.record_tuples
+
+    @pytest.mark.parametrize(
+        "compute, expected",
+        [
+            pytest.param({}, None, id="no-tags"),
+            pytest.param(
+                {"tags": "a:b;tuxops-imds-public-keys-fault:invalid-x509"},
+                "invalid-x509",
+                id="tags-string",
+            ),
+            pytest.param(
+                {
+                    "tagsList": [],
+                    "tags": "tuxops-imds-public-keys-fault:invalid-x509",
+                },
+                None,
+                id="tags-list-is-authoritative",
+            ),
+        ],
+    )
+    def test_tuxops_get_imds_tag(self, compute, expected):
+        assert (
+            dsaz._tuxops_get_imds_tag(compute, dsaz.TUXOPS_IMDS_KEY_FAULT_TAG)
+            == expected
+        )
 
     def test_get_public_ssh_keys_without_imds(self, get_ds):
         self.m_fetch.return_value = dict()
